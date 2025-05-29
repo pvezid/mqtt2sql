@@ -20,9 +20,8 @@ package handlers
 import (
 	"database/sql"
 	"fmt"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/go-sql-driver/mysql"
 	"log/slog"
-	"strings"
 	"time"
 )
 
@@ -38,7 +37,7 @@ func SqliteHandler(ich <-chan Datapoint) {
 
 	ticker := time.NewTicker(3 * time.Minute)
 
-	db := InitDB("/data/measurements.db")
+	db := InitDB()
 	if db != nil {
 		CreateManagementTable(db)
 		for {
@@ -64,13 +63,14 @@ func SqliteHandler(ich <-chan Datapoint) {
 	ticker.Stop()
 }
 
-func InitDB(filepath string) *sql.DB {
-	db, err := sql.Open("sqlite3", filepath)
+func InitDB() *sql.DB {
+	db, err := sql.Open("mysql", "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql")
 	if err != nil {
-		slog.Error("Unable to open database", "filepath", filepath, "err", err)
-	} else {
-		slog.Info("Database opened", "filepath", filepath)
+		slog.Error("Unable to open database", "err", err)
+		return nil
 	}
+
+	slog.Info("Database opened")
 	return db
 }
 
@@ -86,7 +86,7 @@ func InitDB(filepath string) *sql.DB {
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_humidity_pct', 'yes', 'humidity_pct_avg_1h', 'avg', 3600);
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_power_va', 'yes', 'power_va_1m', 'avg', 60);
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_power_watt', 'yes', 'power_watt_1m', 'avg', 60);
-func CreateManagementTable(db *sql.DB) {
+func CreateManagementTable(db *sql.DB) bool {
 	cmd := `
 	CREATE TABLE IF NOT EXISTS management (
 		src_table TEXT,
@@ -99,12 +99,14 @@ func CreateManagementTable(db *sql.DB) {
 	_, err := db.Exec(cmd)
 	if err != nil {
 		slog.Error("Unable to create", "table", "management", "err", err)
-	} else {
-		slog.Info("Table created", "table", "management")
+		return false
 	}
+
+	slog.Info("Table created", "table", "management")
+	return true
 }
 
-func CreateMeasurementsTable(db *sql.DB, table string) {
+func CreateMeasurementsTable(db *sql.DB, table string) bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
 		sensorid TEXT,
@@ -118,12 +120,14 @@ func CreateMeasurementsTable(db *sql.DB, table string) {
 	_, err := db.Exec(cmd)
 	if err != nil {
 		slog.Error("Unable to create", "table", table, "err", err)
-	} else {
-		slog.Info("Table created", "table", table)
+		return false
 	}
+
+	slog.Info("Table created", "table", table)
+	return true
 }
 
-func CreateMeasurementsIndex(db *sql.DB, table string) {
+func CreateMeasurementsIndex(db *sql.DB, table string) bool {
 	cmdTemplate := `
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s
 	ON %s (sensorid, name, place, ts);
@@ -132,14 +136,16 @@ func CreateMeasurementsIndex(db *sql.DB, table string) {
 	_, err := db.Exec(cmd)
 	if err != nil {
 		slog.Error("Unable to create index", "table", table, "err", err)
-	} else {
-		slog.Info("Index created", "table", table)
+		return false
 	}
+
+	slog.Info("Index created", "table", table)
+	return true
 }
 
 // lire avec
 // select datetime(ts,'unixepoch','localtime'),sensorid,name,value from measurements_energy_watthourdiff order by name, ts;
-func InsertMeasurement(db *sql.DB, dp *Datapoint) {
+func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	cmdTemplate := `
 	INSERT INTO %s (sensorid, name, place, ts, value) values(?, ?, ?, ?, ?);
 	`
@@ -147,16 +153,15 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) {
 	cmd := fmt.Sprintf(cmdTemplate, table)
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
-		if strings.Contains(err1.Error(), "no such table") {
-			CreateMeasurementsTable(db, table)
+		slog.Warn("Unable to prepare stmt", "table", table, "err", err1)
+		if CreateMeasurementsTable(db, table) {
 			stmt, err1 = db.Prepare(cmd)
 			if err1 != nil {
 				slog.Error("Unable to prepare stmt", "table", table, "err", err1)
-				return
+				return false
 			}
 		} else {
-			slog.Error("Unable to prepare stmt", "table", table, "err", err1)
-			return
+			return false
 		}
 	}
 	defer stmt.Close()
@@ -164,12 +169,14 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) {
 	_, err2 := stmt.Exec(dp.Tags.ID, dp.Tags.Name, dp.Tags.Place, float64(dp.Timestamp)/1000.0, dp.Fields.Value)
 	if err2 != nil {
 		slog.Error("Insert error", "table", table, "err", err2)
-	} else {
-		slog.Debug("Inserted", "datapoint", dp)
+		return false
 	}
+
+	slog.Debug("Inserted", "datapoint", dp)
+	return true
 }
 
-func DeleteMeasurement(db *sql.DB, item *Item, ts int64) {
+func DeleteMeasurement(db *sql.DB, item *Item, ts int64) bool {
 	cmdTemplate := `
 	DELETE FROM %s WHERE ts < CAST(%d/%.1f AS INTEGER)*%.1f;
 	`
@@ -177,42 +184,42 @@ func DeleteMeasurement(db *sql.DB, item *Item, ts int64) {
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
 		slog.Error("Unable to prepare stmt", "table", item.src, "err", err1)
-		return
+		return false
 	}
 	defer stmt.Close()
 
 	_, err2 := stmt.Exec()
 	if err2 != nil {
 		slog.Error("Delete error", "table", item.src, "err", err2)
-	} else {
-		slog.Debug("Deleted", "table", item.src, "ts", ts)
+		return false
 	}
+
+	slog.Debug("Deleted", "table", item.src, "ts", ts)
+	return true
 }
 
-func InsertConsolidatedData(db *sql.DB, item *Item, ts int64) {
+func InsertConsolidatedData(db *sql.DB, item *Item, ts int64) bool {
 
 	cmdTemplate := `
-	INSERT OR REPLACE INTO %s (sensorid, name, place, ts, value)
-	SELECT sensorid, name, place, CAST(ts/%.1f AS INTEGER)*%.1f as ts, %s(value)
+	REPLACE INTO %s (sensorid, name, place, ts, value)
+	SELECT sensorid, name, place, CAST(ts/%.1f AS UNSIGNED)*%.1f as ts, %s(value)
 	FROM %s
-	WHERE ts < CAST(%d/%.1f AS INTEGER)*%.1f
-	GROUP BY sensorid, name, place, CAST(ts/%.1f AS INTEGRER);
+	WHERE ts < CAST(%d/%.1f AS UNSIGNED)*%.1f
+	GROUP BY sensorid, name, place, CAST(ts/%.1f AS UNSIGNED);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.period, item.period, item.aggr, item.src, ts, item.period, item.period, item.period)
 	slog.Debug("Consolidation", "cmd", cmd)
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
-		if strings.Contains(err1.Error(), "no such table") {
-			CreateMeasurementsTable(db, item.dst)
-			CreateMeasurementsIndex(db, item.dst)
+		slog.Warn("Unable to prepare stmt", "table", item.dst, "err", err1)
+		if CreateMeasurementsTable(db, item.dst) && CreateMeasurementsIndex(db, item.dst) {
 			stmt, err1 = db.Prepare(cmd)
 			if err1 != nil {
 				slog.Error("Unable to prepare stmt", "table", item.dst, "err", err1)
-				return
+				return false
 			}
 		} else {
-			slog.Error("Unable to prepare stmt", "table", item.dst, "err", err1)
-			return
+			return false
 		}
 	}
 	defer stmt.Close()
@@ -220,12 +227,14 @@ func InsertConsolidatedData(db *sql.DB, item *Item, ts int64) {
 	_, err2 := stmt.Exec()
 	if err2 != nil {
 		slog.Error("Insert error", "table", item.dst, "err", err2)
-	} else {
-		slog.Debug("Inserted", "table", item.dst)
+		return false
 	}
+
+	slog.Debug("Inserted", "table", item.dst)
+	return true
 }
 
-func ConsolidateData(db *sql.DB) {
+func ConsolidateData(db *sql.DB) bool {
 	cmd := `
 	SELECT src_table, src_delete, dst_table, aggregate, period FROM management;
 	`
@@ -233,7 +242,7 @@ func ConsolidateData(db *sql.DB) {
 	rows, err1 := db.Query(cmd)
 	if err1 != nil {
 		slog.Error("Unable to query", "table", "management", "err", err1)
-		return
+		return false
 	}
 
 	var result []Item
@@ -242,7 +251,7 @@ func ConsolidateData(db *sql.DB) {
 		err2 := rows.Scan(&item.src, &item.src_delete, &item.dst, &item.aggr, &item.period)
 		if err2 != nil {
 			slog.Error("Unable to fetch", "table", "management", "err", err1)
-			return
+			return false
 		}
 		slog.Info(
 			"table management",
@@ -256,11 +265,15 @@ func ConsolidateData(db *sql.DB) {
 	rows.Close()
 
 	now := time.Now()
+	ts := now.Unix()
 	for _, item := range result {
-		InsertConsolidatedData(db, &item, now.Unix())
-		if item.src_delete == "yes" {
-			DeleteMeasurement(db, &item, now.Unix())
+		if InsertConsolidatedData(db, &item, ts) {
+			if item.src_delete == "yes" {
+				DeleteMeasurement(db, &item, ts)
+			}
 		}
 	}
-	slog.Info("Consolidated", "now", now, "ts", now.Unix())
+
+	slog.Info("Consolidated", "now", now, "ts", ts)
+	return true
 }

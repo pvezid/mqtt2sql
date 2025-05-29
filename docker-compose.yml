@@ -1,0 +1,49 @@
+
+services:
+
+  mariadb:
+    container_name: mariadb
+    image: mariadb:11.7.2
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: example
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    ports:
+      - 127.0.0.1:3306:3306
+    networks:
+      - mynet
+
+  adminer:
+    container_name: adminer
+    image: adminer:5.3.0
+    restart: unless-stopped
+    ports:
+      - 8080:8080
+    networks:
+      - mynet
+    depends_on:
+      - mariadb
+
+  mqtt2sql:
+    container_name: mqtt2sql
+    image: org.menie/mqtt2sql:1.0
+    build:
+      context: .
+      dockerfile: Dockerfile.mqtt2sql
+    restart: unless-stopped
+    networks:
+      - mynet
+    depends_on:
+      - mariadb
+
+volumes:
+  mariadb-data:
+    name: mariadb-data
+
+networks:
+  mynet:
+
+# DROP USER IF EXISTS 'ustd'@'172.18.0.0/24';
+# CREATE USER 'ustd'@'172.18.0.0/24' IDENTIFIED BY 'm55PC2Qh';
+# GRANT ALL PRIVILEGES ON mqtt2sql.* TO 'ustd'@'172.18.0.0/24';

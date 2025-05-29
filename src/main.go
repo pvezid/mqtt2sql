@@ -21,7 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"menie.org/mqtt2sqlite/handlers"
+	"menie.org/mqtt2sql/handlers"
 	"os"
 )
 
