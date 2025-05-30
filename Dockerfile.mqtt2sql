@@ -5,4 +5,4 @@ COPY src .
 RUN go mod download
 RUN go build -v
 
-CMD ["/app/mqtt2sql", "-h", "tcp://mqtt:1883", "-s", "dbdata"]
+CMD ["/app/mqtt2sql", "-h", "tcp://mqtt:1883", "-s", "domos/dbdata"]
