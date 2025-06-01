@@ -129,8 +129,8 @@ func CreateMeasurementsTable(db *sql.DB, table string) bool {
 
 func CreateMeasurementsIndex(db *sql.DB, table string) bool {
 	cmdTemplate := `
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s
-	ON %s (sensorid, name, place, ts);
+	CREATE INDEX IF NOT EXISTS idx_%s_ts
+	ON %s (ts);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table, table)
 	_, err := db.Exec(cmd)
@@ -178,7 +178,7 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 
 func DeleteMeasurement(db *sql.DB, item *Item, ts int64) bool {
 	cmdTemplate := `
-	DELETE FROM %s WHERE ts < CAST(%d/%.1f AS INTEGER)*%.1f;
+	DELETE FROM %s WHERE ts < CAST(%d/%.0f AS UNSIGNED)*%.0f;
 	`
 	cmd := fmt.Sprintf(cmdTemplate, item.src, ts, item.period, item.period)
 	stmt, err1 := db.Prepare(cmd)
@@ -201,11 +201,11 @@ func DeleteMeasurement(db *sql.DB, item *Item, ts int64) bool {
 func InsertConsolidatedData(db *sql.DB, item *Item, ts int64) bool {
 
 	cmdTemplate := `
-	REPLACE INTO %s (sensorid, name, place, ts, value)
-	SELECT sensorid, name, place, CAST(ts/%.1f AS UNSIGNED)*%.1f as ts, %s(value)
+	INSERT INTO %s (sensorid, name, place, ts, value)
+	SELECT sensorid, name, place, CAST(ts/%.0f AS UNSIGNED)*%.0f as ts, %s(value)
 	FROM %s
-	WHERE ts < CAST(%d/%.1f AS UNSIGNED)*%.1f
-	GROUP BY sensorid, name, place, CAST(ts/%.1f AS UNSIGNED);
+	WHERE ts < CAST(%d/%.0f AS UNSIGNED)*%.0f
+	GROUP BY sensorid, name, place, CAST(ts/%.0f AS UNSIGNED);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.period, item.period, item.aggr, item.src, ts, item.period, item.period, item.period)
 	slog.Debug("Consolidation", "cmd", cmd)
@@ -267,13 +267,50 @@ func ConsolidateData(db *sql.DB) bool {
 	now := time.Now()
 	ts := now.Unix()
 	for _, item := range result {
-		if InsertConsolidatedData(db, &item, ts) {
-			if item.src_delete == "yes" {
-				DeleteMeasurement(db, &item, ts)
+		if BeginTransaction(db) {
+			if InsertConsolidatedData(db, &item, ts) {
+				if item.src_delete == "yes" {
+					if DeleteMeasurement(db, &item, ts) {
+						CommitTransaction(db)
+					} else {
+						RollbackTransaction(db)
+					}
+				} else {
+					CommitTransaction(db)
+				}
+			} else {
+				RollbackTransaction(db)
 			}
 		}
 	}
 
 	slog.Info("Consolidated", "now", now, "ts", ts)
+	return true
+}
+
+func BeginTransaction(db *sql.DB) bool {
+	_, err := db.Exec("START TRANSACTION")
+	if err != nil {
+		slog.Error("Unable to start a transaction", "err", err)
+		return false
+	}
+	return true
+}
+
+func CommitTransaction(db *sql.DB) bool {
+	_, err := db.Exec("COMMIT")
+	if err != nil {
+		slog.Error("Unable to commit a transaction", "err", err)
+		return false
+	}
+	return true
+}
+
+func RollbackTransaction(db *sql.DB) bool {
+	_, err := db.Exec("ROLLBACK")
+	if err != nil {
+		slog.Error("Unable to rollback a transaction", "err", err)
+		return false
+	}
 	return true
 }
