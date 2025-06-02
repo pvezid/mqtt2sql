@@ -27,5 +27,5 @@ type Datapoint struct {
 		Name  string `json:"name"`
 		Place string `json:"place"`
 	} `json:"tags"`
-	Timestamp int64 `json:"timestamp"`
+	Timestamp uint64 `json:"timestamp"`
 }

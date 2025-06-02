@@ -30,7 +30,7 @@ type Item struct {
 	src_delete string
 	dst        string
 	aggr       string
-	period     float64
+	period     uint64
 }
 
 func SqliteHandler(ich <-chan Datapoint) {
@@ -90,11 +90,11 @@ func InitDB() *sql.DB {
 func CreateManagementTable(db *sql.DB) bool {
 	cmd := `
 	CREATE TABLE IF NOT EXISTS management (
-		src_table TEXT,
-		src_delete TEXT,
-		dst_table TEXT,
-		aggregate TEXT,
-		period REAL
+		src_table TINYTEXT,
+		src_delete TINYTEXT,
+		dst_table TINYTEXT,
+		aggregate TINYTEXT,
+		period INT UNSIGNED
 	);
 	`
 	_, err := db.Exec(cmd)
@@ -110,11 +110,11 @@ func CreateManagementTable(db *sql.DB) bool {
 func CreateMeasurementsTable(db *sql.DB, table string) bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
-		sensorid TEXT,
-		name TEXT,
-		place TEXT,
-		ts REAL,
-		value REAL
+		sensorid TINYTEXT NOT NULL,
+		name TINYTEXT,
+		place TINYTEXT,
+		ts BIGINT UNSIGNED NOT NULL,
+		value DOUBLE NOT NULL
 	);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table)
@@ -128,10 +128,10 @@ func CreateMeasurementsTable(db *sql.DB, table string) bool {
 	return true
 }
 
-func CreateMeasurementsIndex(db *sql.DB, table string) bool {
+func CreateConsolidatedIndex(db *sql.DB, table string) bool {
 	cmdTemplate := `
-	CREATE INDEX IF NOT EXISTS idx_%s_ts
-	ON %s (ts);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_ts_sensorid
+	ON %s (ts, sensorid);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table, table)
 	_, err := db.Exec(cmd)
@@ -167,7 +167,7 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	}
 	defer stmt.Close()
 
-	_, err2 := stmt.Exec(dp.Tags.ID, dp.Tags.Name, dp.Tags.Place, float64(dp.Timestamp)/1000.0, dp.Fields.Value)
+	_, err2 := stmt.Exec(dp.Tags.ID, dp.Tags.Name, dp.Tags.Place, dp.Timestamp, dp.Fields.Value)
 	if err2 != nil {
 		slog.Error("Insert error", "table", table, "err", err2)
 		return false
@@ -177,11 +177,11 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	return true
 }
 
-func DeleteMeasurement(db *sql.DB, item *Item, ts int64) bool {
+func DeleteMeasurement(db *sql.DB, item *Item, ts uint64) bool {
 	cmdTemplate := `
-	DELETE FROM %s WHERE ts < CAST(%d/%.0f AS UNSIGNED)*%.0f;
+	DELETE FROM %s WHERE ts < %d;
 	`
-	cmd := fmt.Sprintf(cmdTemplate, item.src, ts, item.period, item.period)
+	cmd := fmt.Sprintf(cmdTemplate, item.src, ts)
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
 		slog.Error("Unable to prepare stmt", "table", item.src, "err", err1)
@@ -199,21 +199,21 @@ func DeleteMeasurement(db *sql.DB, item *Item, ts int64) bool {
 	return true
 }
 
-func InsertConsolidatedData(db *sql.DB, item *Item, ts int64) bool {
+func InsertConsolidatedData(db *sql.DB, item *Item, ts uint64) bool {
 
 	cmdTemplate := `
 	INSERT INTO %s (sensorid, name, place, ts, value)
-	SELECT sensorid, name, place, CAST(ts/%.0f AS UNSIGNED)*%.0f as ts, %s(value)
+	SELECT sensorid, name, place, FLOOR(ts/%d)*%d AS t, %s(value)
 	FROM %s
-	WHERE ts < CAST(%d/%.0f AS UNSIGNED)*%.0f
-	GROUP BY sensorid, name, place, CAST(ts/%.0f AS UNSIGNED);
+	WHERE ts < %d
+	GROUP BY sensorid, name, place, t;
 	`
-	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.period, item.period, item.aggr, item.src, ts, item.period, item.period, item.period)
+	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.period*1000, item.period*1000, item.aggr, item.src, ts)
 	slog.Debug("Consolidation", "cmd", cmd)
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
 		slog.Warn("Unable to prepare stmt", "table", item.dst, "err", err1)
-		if CreateMeasurementsTable(db, item.dst) && CreateMeasurementsIndex(db, item.dst) {
+		if CreateMeasurementsTable(db, item.dst) && CreateConsolidatedIndex(db, item.dst) {
 			stmt, err1 = db.Prepare(cmd)
 			if err1 != nil {
 				slog.Error("Unable to prepare stmt", "table", item.dst, "err", err1)
@@ -231,7 +231,7 @@ func InsertConsolidatedData(db *sql.DB, item *Item, ts int64) bool {
 		return false
 	}
 
-	slog.Debug("Inserted", "table", item.dst)
+	slog.Debug("Inserted", "table", item.dst, "ts", ts)
 	return true
 }
 
@@ -266,9 +266,9 @@ func ConsolidateData(db *sql.DB) bool {
 	rows.Close()
 
 	now := time.Now()
-	ts := now.Unix() - 60
 	for _, item := range result {
 		if BeginTransaction(db) {
+			ts := uint64(uint64((now.Unix()-20))/item.period) * item.period * 1000
 			if InsertConsolidatedData(db, &item, ts) {
 				if item.src_delete == "yes" {
 					if DeleteMeasurement(db, &item, ts) {
@@ -285,7 +285,7 @@ func ConsolidateData(db *sql.DB) bool {
 		}
 	}
 
-	slog.Info("Consolidated", "now", now, "ts", ts)
+	slog.Info("Consolidated", "now", now)
 	return true
 }
 
