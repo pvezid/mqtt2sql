@@ -77,6 +77,7 @@ func InitDB() *sql.DB {
 // delete from management;
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_energy_watthourdiff', 'yes', 'energy_watthourdiff_5m', 'sum', 300);
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_energy_watthour', 'yes', 'energy_watthour_5m', 'min', 300);
+// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_energy_wattsec', 'yes', 'energy_wattsec_5m', 'min', 300);
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_tension_volt', 'yes', 'tension_volt_20m', 'avg', 1200);
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_temperature_celsius', 'no', 'temperature_celsius_min_1h', 'min', 3600);
 // insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_temperature_celsius', 'no', 'temperature_celsius_max_1h', 'max', 3600);
@@ -265,7 +266,7 @@ func ConsolidateData(db *sql.DB) bool {
 	rows.Close()
 
 	now := time.Now()
-	ts := now.Unix()
+	ts := now.Unix() - 60
 	for _, item := range result {
 		if BeginTransaction(db) {
 			if InsertConsolidatedData(db, &item, ts) {
