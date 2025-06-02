@@ -74,19 +74,6 @@ func InitDB() *sql.DB {
 	return db
 }
 
-// delete from management;
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_energy_watthourdiff', 'yes', 'energy_watthourdiff_5m', 'sum', 300);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_energy_watthour', 'yes', 'energy_watthour_5m', 'min', 300);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_energy_wattsec', 'yes', 'energy_wattsec_5m', 'min', 300);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_tension_volt', 'yes', 'tension_volt_20m', 'avg', 1200);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_temperature_celsius', 'no', 'temperature_celsius_min_1h', 'min', 3600);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_temperature_celsius', 'no', 'temperature_celsius_max_1h', 'max', 3600);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_temperature_celsius', 'yes', 'temperature_celsius_avg_1h', 'avg', 3600);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_humidity_pct', 'no', 'humidity_pct_min_1h', 'min', 3600);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_humidity_pct', 'no', 'humidity_pct_max_1h', 'max', 3600);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_humidity_pct', 'yes', 'humidity_pct_avg_1h', 'avg', 3600);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_power_va', 'yes', 'power_va_1m', 'avg', 60);
-// insert into management (src_table, src_delete, dst_table, aggregate, period) values('measurements_power_watt', 'yes', 'power_watt_1m', 'avg', 60);
 func CreateManagementTable(db *sql.DB) bool {
 	cmd := `
 	CREATE TABLE IF NOT EXISTS management (
@@ -128,6 +115,27 @@ func CreateMeasurementsTable(db *sql.DB, table string) bool {
 	return true
 }
 
+func CreateConsolidatedTable(db *sql.DB, table string) bool {
+	cmdTemplate := `
+	CREATE TABLE IF NOT EXISTS %s (
+		sensorid TINYTEXT NOT NULL,
+		name TINYTEXT,
+		place TINYTEXT,
+		ts INT UNSIGNED NOT NULL,
+		value DOUBLE NOT NULL
+	);
+	`
+	cmd := fmt.Sprintf(cmdTemplate, table)
+	_, err := db.Exec(cmd)
+	if err != nil {
+		slog.Error("Unable to create", "table", table, "err", err)
+		return false
+	}
+
+	slog.Info("Table created", "table", table)
+	return true
+}
+
 func CreateConsolidatedIndex(db *sql.DB, table string) bool {
 	cmdTemplate := `
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_ts_sensorid
@@ -144,8 +152,6 @@ func CreateConsolidatedIndex(db *sql.DB, table string) bool {
 	return true
 }
 
-// lire avec
-// select datetime(ts,'unixepoch','localtime'),sensorid,name,value from measurements_energy_watthourdiff order by name, ts;
 func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	cmdTemplate := `
 	INSERT INTO %s (sensorid, name, place, ts, value) values(?, ?, ?, ?, ?);
@@ -208,12 +214,12 @@ func InsertConsolidatedData(db *sql.DB, item *Item, ts uint64) bool {
 	WHERE ts < %d
 	GROUP BY sensorid, name, place, t;
 	`
-	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.period*1000, item.period*1000, item.aggr, item.src, ts)
+	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.period*1000, item.period, item.aggr, item.src, ts)
 	slog.Debug("Consolidation", "cmd", cmd)
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
 		slog.Warn("Unable to prepare stmt", "table", item.dst, "err", err1)
-		if CreateMeasurementsTable(db, item.dst) && CreateConsolidatedIndex(db, item.dst) {
+		if CreateConsolidatedTable(db, item.dst) && CreateConsolidatedIndex(db, item.dst) {
 			stmt, err1 = db.Prepare(cmd)
 			if err1 != nil {
 				slog.Error("Unable to prepare stmt", "table", item.dst, "err", err1)

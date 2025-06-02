@@ -43,7 +43,3 @@ volumes:
 
 networks:
   mynet:
-
-# DROP USER IF EXISTS 'ustd'@'172.18.0.%';
-# CREATE USER 'ustd'@'172.18.0.%' IDENTIFIED BY 'm55PC2Qh';
-# GRANT ALL PRIVILEGES ON mqtt2sql.* TO 'ustd'@'172.18.0.%';
