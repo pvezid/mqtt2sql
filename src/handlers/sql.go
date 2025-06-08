@@ -22,15 +22,21 @@ import (
 	"fmt"
 	_ "github.com/go-sql-driver/mysql"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 )
+
+const DefaultCol = "value"
 
 type Item struct {
 	src        string
 	src_delete string
 	dst        string
 	aggr       []string
+	alist      string
+	clist      string
+	dlist      string
 	period     uint64
 	retention  uint64
 }
@@ -105,12 +111,12 @@ func CreateMeasurementTable(db *sql.DB, table string) bool {
 	CREATE TABLE IF NOT EXISTS %s (
 		ts DOUBLE NOT NULL,
 		sensorid TINYTEXT NOT NULL,
-		value DOUBLE NOT NULL,
+		%s DOUBLE NOT NULL,
 		name TINYTEXT,
 		place TINYTEXT
 	);
 	`
-	cmd := fmt.Sprintf(cmdTemplate, table)
+	cmd := fmt.Sprintf(cmdTemplate, table, DefaultCol)
 	_, err := db.Exec(cmd)
 	if err != nil {
 		slog.Error("Unable to create", "table", table, "cmd", cmd, "err", err)
@@ -123,7 +129,7 @@ func CreateMeasurementTable(db *sql.DB, table string) bool {
 
 func CreateMeasurementIndex(db *sql.DB, table string) bool {
 	cmdTemplate := `
-	CREATE INDEX IF NOT EXISTS idx_%s_ts_sensorid_value
+	CREATE INDEX IF NOT EXISTS idx_%s_ts_sensorid
 	ON %s (ts, sensorid);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table, table)
@@ -137,19 +143,6 @@ func CreateMeasurementIndex(db *sql.DB, table string) bool {
 	return true
 }
 
-func mapNames(aggr []string, format string) (string, int) {
-	cola := []string{}
-	for _, f := range aggr {
-		if f == "sum" || f == "min" || f == "max" || f == "avg" {
-			c := fmt.Sprintf(format, f)
-			cola = append(cola, c)
-		}
-
-	}
-	cols := strings.Join(cola, ",")
-	return cols, len(cols)
-}
-
 func CreateConsolidatedTable(db *sql.DB, item *Item) bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
@@ -160,17 +153,14 @@ func CreateConsolidatedTable(db *sql.DB, item *Item) bool {
 		place TINYTEXT
 	);
 	`
-	cols, cnt := mapNames(item.aggr, "v%s DOUBLE NOT NULL")
-	if cnt > 0 {
-		cmd := fmt.Sprintf(cmdTemplate, item.dst, cols)
-		_, err := db.Exec(cmd)
-		if err != nil {
-			slog.Error("Unable to create", "table", item.dst, "cmd", cmd, "err", err)
-			return false
-		}
-
-		slog.Info("Table created", "table", item.dst)
+	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.dlist)
+	_, err := db.Exec(cmd)
+	if err != nil {
+		slog.Error("Unable to create", "table", item.dst, "cmd", cmd, "err", err)
+		return false
 	}
+
+	slog.Info("Table created", "table", item.dst)
 	return true
 }
 
@@ -192,13 +182,13 @@ func CreateConsolidatedIndex(db *sql.DB, table string) bool {
 
 func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	cmdTemplate := `
-	INSERT INTO %s (ts, sensorid, value, name, place) values(?, ?, ?, ?, ?);
+	INSERT INTO %s (ts, sensorid, %s, name, place) values (?, ?, ?, ?, ?);
 	`
 	table := fmt.Sprintf("measurements_%s", dp.Measurement)
-	cmd := fmt.Sprintf(cmdTemplate, table)
+	cmd := fmt.Sprintf(cmdTemplate, table, DefaultCol)
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
-		slog.Warn("Unable to prepare stmt", "table", table, "err", err1)
+		slog.Warn("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err1)
 		if CreateMeasurementTable(db, table) && CreateMeasurementIndex(db, table) {
 			stmt, err1 = db.Prepare(cmd)
 			if err1 != nil {
@@ -230,18 +220,12 @@ func InsertConsolidatedData(db *sql.DB, item *Item, ts uint64) bool {
 	WHERE ts < %d
 	GROUP BY t, sensorid, name, place;
 	`
-	cols, cnt := mapNames(item.aggr, "v%s")
-	vals, _ := mapNames(item.aggr, "%s(value)")
 
-	if cnt == 0 {
-		return true
-	}
-
-	cmd := fmt.Sprintf(cmdTemplate, item.dst, cols, item.period, item.period, vals, item.src, ts)
+	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.clist, item.period, item.period, item.alist, item.src, ts)
 	slog.Debug("Consolidation", "cmd", cmd)
 	stmt, err1 := db.Prepare(cmd)
 	if err1 != nil {
-		slog.Warn("Unable to prepare stmt", "table", item.dst, "err", err1)
+		slog.Warn("Unable to prepare stmt", "table", item.dst, "cmd", cmd, "err", err1)
 		if CreateConsolidatedTable(db, item) && CreateConsolidatedIndex(db, item.dst) {
 			stmt, err1 = db.Prepare(cmd)
 			if err1 != nil {
@@ -297,6 +281,9 @@ func ConsolidateData(db *sql.DB) bool {
 		return false
 	}
 
+	defaultFormat := fmt.Sprintf("%%s(%s)", DefaultCol)
+	slog.Debug("Mapping", "defaultFormat", defaultFormat)
+
 	var result []Item
 	for rows.Next() {
 		item := Item{}
@@ -321,23 +308,42 @@ func ConsolidateData(db *sql.DB) bool {
 		if item.retention > 0 && item.retention < 3600 {
 			item.retention = 3600
 		}
-		slog.Info(
-			"table dispatch",
-			"src_table", item.src,
-			"src_delete", item.src_delete,
-			"dst_table", item.dst,
-			"aggr1", item.aggr[0],
-			"aggr2", item.aggr[1],
-			"aggr3", item.aggr[2],
-			"aggr4", item.aggr[3],
-			"period", item.period,
-			"retention", item.retention)
 		result = append(result, item)
 	}
 	rows.Close()
 
 	now := time.Now()
 	for _, item := range result {
+		item.clist = mapNames(item.aggr, []string{}, "v%s")
+		item.dlist = mapNames(item.aggr, []string{}, "v%s DOUBLE NOT NULL")
+		idx := slices.IndexFunc(result, func(i Item) bool { return i.dst == item.src })
+		if idx >= 0 {
+			item.alist = mapNames(item.aggr, result[idx].aggr, "%%s(v%s)")
+		} else {
+			item.alist = mapNames(item.aggr, []string{DefaultCol, DefaultCol, DefaultCol, DefaultCol}, "%%s(%s)")
+		}
+		slog.Debug(
+			"table dispatch",
+			"src_table", item.src,
+			"src_delete", item.src_delete,
+			"dst_table", item.dst,
+			"aggr", strings.Join(item.aggr, ", "),
+			"alist", item.alist,
+			"clist", item.clist,
+			"dlist", item.dlist,
+			"period", item.period,
+			"retention", item.retention)
+		if len(item.alist) == 0 {
+			continue
+		}
+		slog.Info(
+			"table dispatch",
+			"src_table", item.src,
+			"src_delete", item.src_delete,
+			"dst_table", item.dst,
+			"alist", item.alist,
+			"period", item.period,
+			"retention", item.retention)
 		if BeginTransaction(db) {
 			ts := uint64(uint64((now.Unix()-20))/item.period) * item.period
 			if !InsertConsolidatedData(db, &item, ts) {
@@ -390,4 +396,23 @@ func RollbackTransaction(db *sql.DB) bool {
 		return false
 	}
 	return true
+}
+
+func mapNames(aggr []string, col []string, format string) string {
+	cola := []string{}
+	for i, f := range aggr {
+		if f == "sum" || f == "min" || f == "max" || f == "avg" {
+			var subformat string
+			if len(col) > 0 {
+				subformat = fmt.Sprintf(format, col[i])
+			} else {
+				subformat = format
+			}
+			c := fmt.Sprintf(subformat, f)
+			cola = append(cola, c)
+		}
+
+	}
+	cols := strings.Join(cola, ", ")
+	return cols
 }
