@@ -27,7 +27,10 @@ import (
 	"time"
 )
 
+const connString = "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql"
+const dispatchTable = "dispatch"
 const DefaultCol = "value"
+const MargeTemps = 40
 
 type Item struct {
 	src        string
@@ -41,13 +44,16 @@ type Item struct {
 	retention  uint64
 }
 
+var lastBrowsed map[string]uint64
+
 func SqliteHandler(ich <-chan Datapoint) {
 
 	ticker := time.NewTicker(3 * time.Minute)
+	lastBrowsed = make(map[string]uint64)
 
 	db := InitDB()
 	if db != nil {
-		CreateDispatchingTable(db)
+		defer db.Close()
 		for {
 			select {
 			case dp := <-ich:
@@ -62,29 +68,45 @@ func SqliteHandler(ich <-chan Datapoint) {
 				InsertMeasurement(db, &dp)
 			case t := <-ticker.C:
 				slog.Debug("Tick", "at", t)
-				ConsolidateData(db)
+				items, err := ReadDispatchingTable(db)
+				if err != nil {
+					slog.Warn("Unable to query", "table", dispatchTable, "err", err)
+					if CreateDispatchingTable(db) && CreateDispatchingIndex(db) {
+						if items, err = ReadDispatchingTable(db); err != nil {
+							slog.Error("Unable to query", "table", dispatchTable, "err", err)
+							continue
+						}
+					} else {
+						continue
+					}
+				}
+				for _, item := range items {
+					if maxts, err := ReadMaxTimestamp(db, item.dst); err == nil {
+						lastBrowsed[item.dst] = uint64((uint64(maxts)/item.period)+1) * item.period
+					}
+				}
+				ConsolidateData(db, items)
 			}
 		}
-		db.Close()
 	}
 
 	ticker.Stop()
 }
 
 func InitDB() *sql.DB {
-	db, err := sql.Open("mysql", "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql")
-	if err != nil {
+	if db, err := sql.Open("mysql", connString); err != nil {
 		slog.Error("Unable to open database", "err", err)
 		return nil
+	} else {
+		slog.Info("Database opened")
+		return db
 	}
-
-	slog.Info("Database opened")
-	return db
 }
 
 func CreateDispatchingTable(db *sql.DB) bool {
-	cmd := `
-	CREATE TABLE IF NOT EXISTS dispatch (
+	cmdTemplate := `
+	CREATE TABLE IF NOT EXISTS %s (
+		rank INT UNSIGNED NOT NULL,
 		src_table TINYTEXT NOT NULL,
 		src_delete TINYTEXT NOT NULL,
 		dst_table TINYTEXT NOT NULL,
@@ -96,13 +118,103 @@ func CreateDispatchingTable(db *sql.DB) bool {
 		retention INT UNSIGNED NOT NULL
 	);
 	`
-	_, err := db.Exec(cmd)
-	if err != nil {
-		slog.Error("Unable to create", "table", "dispatch", "cmd", cmd, "err", err)
+	cmd := fmt.Sprintf(cmdTemplate, dispatchTable)
+	if _, err := db.Exec(cmd); err != nil {
+		slog.Error("Unable to create", "table", dispatchTable, "cmd", cmd, "err", err)
 		return false
 	}
 
-	slog.Info("Table created", "table", "dispatch")
+	slog.Info("Table created", "table", dispatchTable)
+	return true
+}
+
+func CreateDispatchingIndex(db *sql.DB) bool {
+	cmdTemplate1 := `
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_rank
+	ON %s (rank);
+	`
+	cmd := fmt.Sprintf(cmdTemplate1, dispatchTable, dispatchTable)
+	if _, err := db.Exec(cmd); err != nil {
+		slog.Error("Unable to create index", "table", dispatchTable, "cmd", cmd, "err", err)
+		return false
+	}
+
+	cmdTemplate2 := `
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_dst_table
+	ON %s (dst_table);
+	`
+	cmd = fmt.Sprintf(cmdTemplate2, dispatchTable, dispatchTable)
+	if _, err := db.Exec(cmd); err != nil {
+		slog.Error("Unable to create index", "table", dispatchTable, "cmd", cmd, "err", err)
+		return false
+	}
+
+	slog.Info("Indexes created", "table", dispatchTable)
+	return true
+}
+
+func ConsolidateData(db *sql.DB, items []Item) bool {
+	now := time.Now()
+	for _, item := range items {
+		item.clist = mapNames(item.aggr, []string{}, "v%s")
+		item.dlist = mapNames(item.aggr, []string{}, "v%s DOUBLE NOT NULL")
+		idx := slices.IndexFunc(items, func(i Item) bool { return i.dst == item.src })
+		if idx >= 0 {
+			item.alist = mapNames(item.aggr, items[idx].aggr, "%%s(v%s)")
+		} else {
+			item.alist = mapNames(item.aggr, []string{DefaultCol, DefaultCol, DefaultCol, DefaultCol}, "%%s(%s)")
+		}
+		t2 := uint64(uint64((now.Unix()-MargeTemps))/item.period) * item.period
+		t1 := lastBrowsed[item.dst]
+		lastBrowsed[item.dst] = t2
+		slog.Debug(
+			"dispatching",
+			"src_table", item.src,
+			"src_delete", item.src_delete,
+			"dst_table", item.dst,
+			"aggr", strings.Join(item.aggr, ", "),
+			"alist", item.alist,
+			"clist", item.clist,
+			"dlist", item.dlist,
+			"period", item.period,
+			"retention", item.retention,
+			"last_ts", t1,
+			"ts", t2)
+		if len(item.alist) == 0 || t2 <= t1 {
+			continue
+		}
+		slog.Info(
+			"dispatching",
+			"src_table", item.src,
+			"src_delete", item.src_delete,
+			"dst_table", item.dst,
+			"alist", item.alist,
+			"period", item.period,
+			"retention", item.retention,
+			"last_ts", t1,
+			"ts", t2)
+		if BeginTransaction(db) {
+			if !InsertConsolidatedData(db, item, t1, t2) {
+				RollbackTransaction(db)
+				continue
+			}
+			if item.src_delete == "yes" {
+				if !DeleteData(db, item.src, t1, t2) {
+					RollbackTransaction(db)
+					continue
+				}
+			}
+			if item.retention > 0 && t2 > item.retention {
+				if !DeleteData(db, item.dst, 0, t2-item.retention) {
+					RollbackTransaction(db)
+					continue
+				}
+			}
+			CommitTransaction(db)
+		}
+	}
+
+	slog.Info("Consolidated", "now", now)
 	return true
 }
 
@@ -117,8 +229,7 @@ func CreateMeasurementTable(db *sql.DB, table string) bool {
 	);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table, DefaultCol)
-	_, err := db.Exec(cmd)
-	if err != nil {
+	if _, err := db.Exec(cmd); err != nil {
 		slog.Error("Unable to create", "table", table, "cmd", cmd, "err", err)
 		return false
 	}
@@ -133,8 +244,7 @@ func CreateMeasurementIndex(db *sql.DB, table string) bool {
 	ON %s (ts, sensorid);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table, table)
-	_, err := db.Exec(cmd)
-	if err != nil {
+	if _, err := db.Exec(cmd); err != nil {
 		slog.Error("Unable to create index", "table", table, "cmd", cmd, "err", err)
 		return false
 	}
@@ -143,7 +253,7 @@ func CreateMeasurementIndex(db *sql.DB, table string) bool {
 	return true
 }
 
-func CreateConsolidatedTable(db *sql.DB, item *Item) bool {
+func CreateConsolidatedTable(db *sql.DB, item Item) bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
 		ts DOUBLE NOT NULL,
@@ -154,8 +264,7 @@ func CreateConsolidatedTable(db *sql.DB, item *Item) bool {
 	);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.dlist)
-	_, err := db.Exec(cmd)
-	if err != nil {
+	if _, err := db.Exec(cmd); err != nil {
 		slog.Error("Unable to create", "table", item.dst, "cmd", cmd, "err", err)
 		return false
 	}
@@ -170,8 +279,7 @@ func CreateConsolidatedIndex(db *sql.DB, table string) bool {
 	ON %s (ts, sensorid);
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table, table)
-	_, err := db.Exec(cmd)
-	if err != nil {
+	if _, err := db.Exec(cmd); err != nil {
 		slog.Error("Unable to create index", "table", table, "cmd", cmd, "err", err)
 		return false
 	}
@@ -180,115 +288,21 @@ func CreateConsolidatedIndex(db *sql.DB, table string) bool {
 	return true
 }
 
-func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
+func ReadDispatchingTable(db *sql.DB) ([]Item, error) {
 	cmdTemplate := `
-	INSERT INTO %s (ts, sensorid, %s, name, place) values (?, ?, ?, ?, ?);
+	SELECT src_table, src_delete, dst_table, aggr1, aggr2, aggr3, aggr4, period, retention FROM %s ORDER BY rank;
 	`
-	table := fmt.Sprintf("measurements_%s", dp.Measurement)
-	cmd := fmt.Sprintf(cmdTemplate, table, DefaultCol)
-	stmt, err1 := db.Prepare(cmd)
-	if err1 != nil {
-		slog.Warn("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err1)
-		if CreateMeasurementTable(db, table) && CreateMeasurementIndex(db, table) {
-			stmt, err1 = db.Prepare(cmd)
-			if err1 != nil {
-				slog.Error("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err1)
-				return false
-			}
-		} else {
-			return false
-		}
+	cmd := fmt.Sprintf(cmdTemplate, dispatchTable)
+	rows, err := db.Query(cmd)
+	if err != nil {
+		return nil, err
 	}
-	defer stmt.Close()
-
-	_, err2 := stmt.Exec(float64(dp.Timestamp)/1000.0, dp.Tags.ID, dp.Fields.Value, dp.Tags.Name, dp.Tags.Place)
-	if err2 != nil {
-		slog.Error("Insert error", "table", table, "data", dp, "err", err2)
-		return false
-	}
-
-	slog.Debug("Inserted", "data", dp)
-	return true
-}
-
-func InsertConsolidatedData(db *sql.DB, item *Item, ts uint64) bool {
-
-	cmdTemplate := `
-	REPLACE INTO %s (ts, sensorid, %s, name, place)
-	SELECT FLOOR(ts/%d)*%d AS t, sensorid, %s, name, place
-	FROM %s
-	WHERE ts < %d
-	GROUP BY t, sensorid, name, place;
-	`
-
-	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.clist, item.period, item.period, item.alist, item.src, ts)
-	slog.Debug("Consolidation", "cmd", cmd)
-	stmt, err1 := db.Prepare(cmd)
-	if err1 != nil {
-		slog.Warn("Unable to prepare stmt", "table", item.dst, "cmd", cmd, "err", err1)
-		if CreateConsolidatedTable(db, item) && CreateConsolidatedIndex(db, item.dst) {
-			stmt, err1 = db.Prepare(cmd)
-			if err1 != nil {
-				slog.Error("Unable to prepare stmt", "table", item.dst, "cmd", cmd, "err", err1)
-				return false
-			}
-		} else {
-			return false
-		}
-	}
-	defer stmt.Close()
-
-	_, err2 := stmt.Exec()
-	if err2 != nil {
-		slog.Error("Insert error", "table", item.dst, "err", err2)
-		return false
-	}
-
-	slog.Debug("Inserted", "table", item.dst, "ts", ts)
-	return true
-}
-
-func DeleteData(db *sql.DB, table string, ts uint64) bool {
-	cmdTemplate := `
-	DELETE FROM %s WHERE ts < %d;
-	`
-	cmd := fmt.Sprintf(cmdTemplate, table, ts)
-	stmt, err1 := db.Prepare(cmd)
-	if err1 != nil {
-		slog.Error("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err1)
-		return false
-	}
-	defer stmt.Close()
-
-	_, err2 := stmt.Exec()
-	if err2 != nil {
-		slog.Error("Delete error", "table", table, "err", err2)
-		return false
-	}
-
-	slog.Debug("Deleted", "table", table, "ts", ts)
-	return true
-}
-
-func ConsolidateData(db *sql.DB) bool {
-	cmd := `
-	SELECT src_table, src_delete, dst_table, aggr1, aggr2, aggr3, aggr4, period, retention FROM dispatch;
-	`
-
-	rows, err1 := db.Query(cmd)
-	if err1 != nil {
-		slog.Error("Unable to query", "table", "dispatch", "err", err1)
-		return false
-	}
-
-	defaultFormat := fmt.Sprintf("%%s(%s)", DefaultCol)
-	slog.Debug("Mapping", "defaultFormat", defaultFormat)
 
 	var result []Item
 	for rows.Next() {
 		item := Item{}
 		aggr := []string{"", "", "", ""}
-		err2 := rows.Scan(&item.src,
+		err := rows.Scan(&item.src,
 			&item.src_delete,
 			&item.dst,
 			&aggr[0],
@@ -298,82 +312,132 @@ func ConsolidateData(db *sql.DB) bool {
 			&item.period,
 			&item.retention)
 		item.aggr = aggr
-		if err2 != nil {
-			slog.Error("Unable to fetch", "table", "dispatch", "err", err1)
-			return false
+		if err != nil {
+			slog.Error("Unable to fetch", "table", dispatchTable, "err", err)
+			continue
 		}
-		if item.period < 60 {
-			item.period = 60
+		if item.period > 0 {
+			item.period *= 60
+			item.retention *= 60
+			result = append(result, item)
 		}
-		if item.retention > 0 && item.retention < 3600 {
-			item.retention = 3600
-		}
-		result = append(result, item)
 	}
 	rows.Close()
 
-	now := time.Now()
-	for _, item := range result {
-		item.clist = mapNames(item.aggr, []string{}, "v%s")
-		item.dlist = mapNames(item.aggr, []string{}, "v%s DOUBLE NOT NULL")
-		idx := slices.IndexFunc(result, func(i Item) bool { return i.dst == item.src })
-		if idx >= 0 {
-			item.alist = mapNames(item.aggr, result[idx].aggr, "%%s(v%s)")
-		} else {
-			item.alist = mapNames(item.aggr, []string{DefaultCol, DefaultCol, DefaultCol, DefaultCol}, "%%s(%s)")
-		}
-		slog.Debug(
-			"table dispatch",
-			"src_table", item.src,
-			"src_delete", item.src_delete,
-			"dst_table", item.dst,
-			"aggr", strings.Join(item.aggr, ", "),
-			"alist", item.alist,
-			"clist", item.clist,
-			"dlist", item.dlist,
-			"period", item.period,
-			"retention", item.retention)
-		if len(item.alist) == 0 {
-			continue
-		}
-		slog.Info(
-			"table dispatch",
-			"src_table", item.src,
-			"src_delete", item.src_delete,
-			"dst_table", item.dst,
-			"alist", item.alist,
-			"period", item.period,
-			"retention", item.retention)
-		if BeginTransaction(db) {
-			ts := uint64(uint64((now.Unix()-20))/item.period) * item.period
-			if !InsertConsolidatedData(db, &item, ts) {
-				RollbackTransaction(db)
-				continue
-			}
-			if item.src_delete == "yes" {
-				if !DeleteData(db, item.src, ts) {
-					RollbackTransaction(db)
-					continue
-				}
-			}
-			if item.retention > 0 {
-				reten := ts - item.retention
-				if !DeleteData(db, item.dst, reten) {
-					RollbackTransaction(db)
-					continue
-				}
-			}
-			CommitTransaction(db)
-		}
+	return result, nil
+}
+
+func ReadMaxTimestamp(db *sql.DB, table string) (float64, error) {
+	cmdTemplate := `
+	SELECT max(ts) FROM %s;
+	`
+	cmd := fmt.Sprintf(cmdTemplate, table)
+	rows, err := db.Query(cmd)
+	if err != nil {
+		return 0, err
 	}
 
-	slog.Info("Consolidated", "now", now)
+	var maxts float64
+	for rows.Next() {
+		err := rows.Scan(&maxts)
+		if err != nil {
+			slog.Error("Unable to fetch", "table", table, "err", err)
+			return 0, err
+		}
+		break
+	}
+	rows.Close()
+
+	return maxts, nil
+}
+
+func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
+	cmdTemplate := `
+	INSERT INTO %s (ts, sensorid, %s, name, place) values (?, ?, ?, ?, ?);
+	`
+	table := fmt.Sprintf("measurements_%s", dp.Measurement)
+	cmd := fmt.Sprintf(cmdTemplate, table, DefaultCol)
+	stmt, err := db.Prepare(cmd)
+	if err != nil {
+		slog.Warn("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err)
+		if CreateMeasurementTable(db, table) && CreateMeasurementIndex(db, table) {
+			if stmt, err = db.Prepare(cmd); err != nil {
+				slog.Error("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err)
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	defer stmt.Close()
+
+	if _, err := stmt.Exec(float64(dp.Timestamp)/1000.0, dp.Tags.ID, dp.Fields.Value, dp.Tags.Name, dp.Tags.Place); err != nil {
+		slog.Error("Insert error", "table", table, "data", dp, "err", err)
+		return false
+	}
+
+	slog.Debug("Inserted", "data", dp)
+	return true
+}
+
+func InsertConsolidatedData(db *sql.DB, item Item, t1 uint64, t2 uint64) bool {
+
+	cmdTemplate := `
+	INSERT INTO %s (ts, sensorid, %s, name, place)
+	SELECT FLOOR(ts/%d)*%d AS t, sensorid, %s, name, place
+	FROM %s
+	WHERE ts >= %d AND ts < %d
+	GROUP BY t, sensorid, name, place;
+	`
+
+	cmd := fmt.Sprintf(cmdTemplate, item.dst, item.clist, item.period, item.period, item.alist, item.src, t1, t2)
+	slog.Debug("Consolidation", "cmd", cmd)
+	stmt, err := db.Prepare(cmd)
+	if err != nil {
+		slog.Warn("Unable to prepare stmt", "table", item.dst, "cmd", cmd, "err", err)
+		if CreateConsolidatedTable(db, item) && CreateConsolidatedIndex(db, item.dst) {
+			if stmt, err = db.Prepare(cmd); err != nil {
+				slog.Error("Unable to prepare stmt", "table", item.dst, "cmd", cmd, "err", err)
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	defer stmt.Close()
+
+	if _, err2 := stmt.Exec(); err2 != nil {
+		slog.Error("Insert error", "table", item.dst, "err", err2)
+		return false
+	}
+
+	slog.Debug("Inserted", "table", item.dst, "t1", t1, "t2", t2)
+	return true
+}
+
+func DeleteData(db *sql.DB, table string, t1 uint64, t2 uint64) bool {
+	cmdTemplate := `
+	DELETE FROM %s WHERE ts >= %d AND ts < %d;
+	`
+	cmd := fmt.Sprintf(cmdTemplate, table, t1, t2)
+	stmt, err := db.Prepare(cmd)
+	if err != nil {
+		slog.Error("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err)
+		return false
+	}
+	defer stmt.Close()
+
+	if _, err := stmt.Exec(); err != nil {
+		slog.Error("Delete error", "table", table, "err", err)
+		return false
+	}
+
+	slog.Debug("Deleted", "table", table, "t1", t1, "t2", t2)
 	return true
 }
 
 func BeginTransaction(db *sql.DB) bool {
-	_, err := db.Exec("START TRANSACTION")
-	if err != nil {
+	if _, err := db.Exec("START TRANSACTION"); err != nil {
 		slog.Error("Unable to start a transaction", "err", err)
 		return false
 	}
@@ -381,8 +445,7 @@ func BeginTransaction(db *sql.DB) bool {
 }
 
 func CommitTransaction(db *sql.DB) bool {
-	_, err := db.Exec("COMMIT")
-	if err != nil {
+	if _, err := db.Exec("COMMIT"); err != nil {
 		slog.Error("Unable to commit a transaction", "err", err)
 		return false
 	}
@@ -390,8 +453,7 @@ func CommitTransaction(db *sql.DB) bool {
 }
 
 func RollbackTransaction(db *sql.DB) bool {
-	_, err := db.Exec("ROLLBACK")
-	if err != nil {
+	if _, err := db.Exec("ROLLBACK"); err != nil {
 		slog.Error("Unable to rollback a transaction", "err", err)
 		return false
 	}
