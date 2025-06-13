@@ -46,6 +46,13 @@ type Item struct {
 
 var lastBrowsed map[string]uint64
 
+type Index struct {
+	nom   string
+	attr  string
+	table string
+	cols  string
+}
+
 func SqliteHandler(ich <-chan Datapoint) {
 
 	ticker := time.NewTicker(3 * time.Minute)
@@ -54,6 +61,8 @@ func SqliteHandler(ich <-chan Datapoint) {
 	db := InitDB()
 	if db != nil {
 		defer db.Close()
+		// results not used, this is to create the table as early as possible
+		ReadOrCreateDispatchingTable(db)
 		for {
 			select {
 			case dp := <-ich:
@@ -68,24 +77,16 @@ func SqliteHandler(ich <-chan Datapoint) {
 				InsertMeasurement(db, &dp)
 			case t := <-ticker.C:
 				slog.Debug("Tick", "at", t)
-				items, err := ReadDispatchingTable(db)
-				if err != nil {
-					slog.Warn("Unable to query", "table", dispatchTable, "err", err)
-					if CreateDispatchingTable(db) && CreateDispatchingIndex(db) {
-						if items, err = ReadDispatchingTable(db); err != nil {
-							slog.Error("Unable to query", "table", dispatchTable, "err", err)
-							continue
+				if items, ok := ReadOrCreateDispatchingTable(db); ok {
+					for _, item := range items {
+						if maxts, ok := ReadMaxTimestamp(db, item.dst); ok {
+							lastBrowsed[item.dst] = uint64((uint64(maxts)/item.period)+1) * item.period
+						} else {
+							lastBrowsed[item.dst] = 0
 						}
-					} else {
-						continue
 					}
+					ConsolidateData(db, items)
 				}
-				for _, item := range items {
-					if maxts, err := ReadMaxTimestamp(db, item.dst); err == nil {
-						lastBrowsed[item.dst] = uint64((uint64(maxts)/item.period)+1) * item.period
-					}
-				}
-				ConsolidateData(db, items)
 			}
 		}
 	}
@@ -101,6 +102,22 @@ func InitDB() *sql.DB {
 		slog.Info("Database opened")
 		return db
 	}
+}
+
+func ReadOrCreateDispatchingTable(db *sql.DB) ([]Item, bool) {
+	items, err := ReadDispatchingTable(db)
+	if err != nil {
+		slog.Warn("Unable to query", "table", dispatchTable, "err", err)
+		if CreateDispatchingTable(db) && CreateDispatchingIndex(db) {
+			if items, err = ReadDispatchingTable(db); err != nil {
+				slog.Error("Unable to query", "table", dispatchTable, "err", err)
+				return nil, false
+			}
+		} else {
+			return nil, false
+		}
+	}
+	return items, true
 }
 
 func CreateDispatchingTable(db *sql.DB) bool {
@@ -129,28 +146,11 @@ func CreateDispatchingTable(db *sql.DB) bool {
 }
 
 func CreateDispatchingIndex(db *sql.DB) bool {
-	cmdTemplate1 := `
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_rank
-	ON %s (rank);
-	`
-	cmd := fmt.Sprintf(cmdTemplate1, dispatchTable, dispatchTable)
-	if _, err := db.Exec(cmd); err != nil {
-		slog.Error("Unable to create index", "table", dispatchTable, "cmd", cmd, "err", err)
-		return false
+	indexes := []Index{
+		Index{"idxdisp_rank", "UNIQUE", dispatchTable, "rank"},
+		Index{"idxdisp_dst_table", "UNIQUE", dispatchTable, "dst_table"},
 	}
-
-	cmdTemplate2 := `
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_dst_table
-	ON %s (dst_table);
-	`
-	cmd = fmt.Sprintf(cmdTemplate2, dispatchTable, dispatchTable)
-	if _, err := db.Exec(cmd); err != nil {
-		slog.Error("Unable to create index", "table", dispatchTable, "cmd", cmd, "err", err)
-		return false
-	}
-
-	slog.Info("Indexes created", "table", dispatchTable)
-	return true
+	return CreateIndexes(db, indexes)
 }
 
 func ConsolidateData(db *sql.DB, items []Item) bool {
@@ -166,7 +166,6 @@ func ConsolidateData(db *sql.DB, items []Item) bool {
 		}
 		t2 := uint64(uint64((now.Unix()-MargeTemps))/item.period) * item.period
 		t1 := lastBrowsed[item.dst]
-		lastBrowsed[item.dst] = t2
 		slog.Debug(
 			"dispatching",
 			"src_table", item.src,
@@ -239,18 +238,10 @@ func CreateMeasurementTable(db *sql.DB, table string) bool {
 }
 
 func CreateMeasurementIndex(db *sql.DB, table string) bool {
-	cmdTemplate := `
-	CREATE INDEX IF NOT EXISTS idx_%s_ts_sensorid
-	ON %s (ts, sensorid);
-	`
-	cmd := fmt.Sprintf(cmdTemplate, table, table)
-	if _, err := db.Exec(cmd); err != nil {
-		slog.Error("Unable to create index", "table", table, "cmd", cmd, "err", err)
-		return false
+	indexes := []Index{
+		Index{"idxmeas_ts_sensorid", "", table, "ts, sensorid"},
 	}
-
-	slog.Info("Index created", "table", table)
-	return true
+	return CreateIndexes(db, indexes)
 }
 
 func CreateConsolidatedTable(db *sql.DB, item Item) bool {
@@ -274,18 +265,10 @@ func CreateConsolidatedTable(db *sql.DB, item Item) bool {
 }
 
 func CreateConsolidatedIndex(db *sql.DB, table string) bool {
-	cmdTemplate := `
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_ts_sensorid
-	ON %s (ts, sensorid);
-	`
-	cmd := fmt.Sprintf(cmdTemplate, table, table)
-	if _, err := db.Exec(cmd); err != nil {
-		slog.Error("Unable to create index", "table", table, "cmd", cmd, "err", err)
-		return false
+	indexes := []Index{
+		Index{"idxcons_ts_sensorid_name_place", "UNIQUE", table, "ts, sensorid, name, place"},
 	}
-
-	slog.Info("Index created", "table", table)
-	return true
+	return CreateIndexes(db, indexes)
 }
 
 func ReadDispatchingTable(db *sql.DB) ([]Item, error) {
@@ -327,28 +310,32 @@ func ReadDispatchingTable(db *sql.DB) ([]Item, error) {
 	return result, nil
 }
 
-func ReadMaxTimestamp(db *sql.DB, table string) (float64, error) {
+func ReadMaxTimestamp(db *sql.DB, table string) (float64, bool) {
 	cmdTemplate := `
 	SELECT max(ts) FROM %s;
 	`
 	cmd := fmt.Sprintf(cmdTemplate, table)
 	rows, err := db.Query(cmd)
 	if err != nil {
-		return 0, err
+		return 0, false
 	}
 
-	var maxts float64
+	var maxts sql.NullFloat64
 	for rows.Next() {
 		err := rows.Scan(&maxts)
 		if err != nil {
 			slog.Error("Unable to fetch", "table", table, "err", err)
-			return 0, err
+			return 0, false
 		}
 		break
 	}
 	rows.Close()
 
-	return maxts, nil
+	if maxts.Valid {
+		return maxts.Float64, true
+	} else {
+		return 0, false
+	}
 }
 
 func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
@@ -458,6 +445,23 @@ func RollbackTransaction(db *sql.DB) bool {
 		return false
 	}
 	return true
+}
+
+func CreateIndexes(db *sql.DB, indexes []Index) bool {
+	ret := true
+	cmdTemplate := "CREATE %s INDEX IF NOT EXISTS %s ON %s (%s)"
+
+	for _, idx := range indexes {
+		cmd := fmt.Sprintf(cmdTemplate, idx.attr, idx.nom, idx.table, idx.cols)
+		if _, err := db.Exec(cmd); err != nil {
+			slog.Error("Unable to create index", "cmd", cmd, "err", err)
+			ret = false
+		} else {
+			slog.Info("Index created", "table", idx.table, "index", idx.nom)
+		}
+	}
+
+	return ret
 }
 
 func mapNames(aggr []string, col []string, format string) string {

@@ -37,6 +37,17 @@ services:
     depends_on:
       - mariadb
 
+  tools:
+    container_name: tools
+    image: org.menie/tools:1.0
+    restart: unless-stopped
+    volumes:
+      - $PWD:/restore
+    networks:
+      - mynet
+    depends_on:
+      - mariadb
+
 volumes:
   mariadb-data:
     name: mariadb-data
