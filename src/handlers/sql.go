@@ -300,8 +300,7 @@ func ReadDispatchingTable(db *sql.DB) ([]Item, error) {
 			continue
 		}
 		if item.period > 0 {
-			item.period *= 60
-			item.retention *= 60
+			item.retention *= 3600
 			result = append(result, item)
 		}
 	}
