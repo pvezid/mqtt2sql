@@ -267,6 +267,7 @@ func CreateConsolidatedTable(db *sql.DB, item Item) bool {
 func CreateConsolidatedIndex(db *sql.DB, table string) bool {
 	indexes := []Index{
 		Index{"idxcons_ts_sensorid_name_place", "UNIQUE", table, "ts, sensorid, name, place"},
+		Index{"idxcons_ts", "", table, "ts"},
 	}
 	return CreateIndexes(db, indexes)
 }
