@@ -240,6 +240,7 @@ func CreateMeasurementTable(db *sql.DB, table string) bool {
 func CreateMeasurementIndex(db *sql.DB, table string) bool {
 	indexes := []Index{
 		Index{"idxmeas_ts_sensorid", "", table, "ts, sensorid"},
+		Index{"idxmeas_ts", "", table, "ts"},
 	}
 	return CreateIndexes(db, indexes)
 }
