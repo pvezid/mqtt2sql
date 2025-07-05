@@ -359,12 +359,15 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	}
 	defer stmt.Close()
 
-	if _, err := stmt.Exec(float64(dp.Timestamp)/1000.0, dp.Tags.ID, dp.Fields.Value, dp.Tags.Name, dp.Tags.Place); err != nil {
+	result, err := stmt.Exec(float64(dp.Timestamp)/1000.0, dp.Tags.ID, dp.Fields.Value, dp.Tags.Name, dp.Tags.Place)
+	if err != nil {
 		slog.Error("Insert error", "table", table, "data", dp, "err", err)
 		return false
 	}
 
-	slog.Debug("Inserted", "data", dp)
+	affected, _ := result.RowsAffected()
+	slog.Debug("Inserted", "data", dp, "affected rows", affected)
+
 	return true
 }
 
@@ -394,12 +397,15 @@ func InsertConsolidatedData(db *sql.DB, item Item, t1 uint64, t2 uint64) bool {
 	}
 	defer stmt.Close()
 
-	if _, err2 := stmt.Exec(); err2 != nil {
+	result, err2 := stmt.Exec()
+	if err2 != nil {
 		slog.Error("Insert error", "table", item.dst, "err", err2)
 		return false
 	}
 
-	slog.Debug("Inserted", "table", item.dst, "t1", t1, "t2", t2)
+	affected, _ := result.RowsAffected()
+	slog.Info("Inserted", "table", item.dst, "t1", t1, "t2", t2, "affected rows", affected)
+
 	return true
 }
 
@@ -415,12 +421,15 @@ func DeleteData(db *sql.DB, table string, t1 uint64, t2 uint64) bool {
 	}
 	defer stmt.Close()
 
-	if _, err := stmt.Exec(); err != nil {
+	result, err := stmt.Exec()
+	if err != nil {
 		slog.Error("Delete error", "table", table, "err", err)
 		return false
 	}
 
-	slog.Debug("Deleted", "table", table, "t1", t1, "t2", t2)
+	affected, _ := result.RowsAffected()
+	slog.Info("Deleted", "table", table, "t1", t1, "t2", t2, "affected rows", affected)
+
 	return true
 }
 
