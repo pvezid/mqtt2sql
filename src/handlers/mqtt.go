@@ -34,6 +34,10 @@ func MQTTHandler(brokerURL string, subtopic string, och chan<- string) bool {
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(brokerURL)
 	opts.SetDefaultPublishHandler(messagePubHandler)
+	opts.SetAutoReconnect(true)
+	opts.SetConnectionLostHandler(func(client mqtt.Client, reason error) {
+		slog.Warn("MQTT connection lost", "broker", brokerURL, "reason", reason.Error())
+	})
 
 	mqttcli := mqtt.NewClient(opts)
 	if token := mqttcli.Connect(); token.Wait() && token.Error() != nil {
