@@ -27,11 +27,6 @@ import (
 	"time"
 )
 
-const connString = "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql"
-const dispatchTable = "dispatch"
-const DefaultCol = "value"
-const MargeTemps = 40
-
 type Item struct {
 	src        string
 	src_delete string
@@ -44,8 +39,6 @@ type Item struct {
 	retention  uint64
 }
 
-var lastBrowsed map[string]uint64
-
 type Index struct {
 	nom   string
 	attr  string
@@ -53,10 +46,23 @@ type Index struct {
 	cols  string
 }
 
+const (
+	connString    = "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql"
+	dispatchTable = "dispatch"
+	DefaultCol    = "value"
+	MargeTemps    = 40
+)
+
+var (
+	lastBrowsed  map[string]uint64
+	measReceived map[string]int64
+)
+
 func SqliteHandler(ich <-chan Datapoint) {
 
 	ticker := time.NewTicker(3 * time.Minute)
 	lastBrowsed = make(map[string]uint64)
+	measReceived = make(map[string]int64)
 
 	db := InitDB()
 	if db != nil {
@@ -191,23 +197,25 @@ func ConsolidateData(db *sql.DB, items []Item) bool {
 			"period", item.period,
 			"retention", item.retention,
 			"last_ts", t1,
-			"ts", t2)
+			"ts", t2,
+			"received", measReceived[item.src])
 		if BeginTransaction(db) {
 			if !InsertConsolidatedData(db, item, t1, t2) {
 				RollbackTransaction(db)
 				continue
-			}
-			if item.src_delete == "yes" {
-				if !DeleteData(db, item.src, t1, t2) {
-					RollbackTransaction(db)
-					continue
-				}
 			}
 			if item.retention > 0 && t2 > item.retention {
 				if !DeleteData(db, item.dst, 0, t2-item.retention) {
 					RollbackTransaction(db)
 					continue
 				}
+			}
+			if item.src_delete == "yes" {
+				if !DeleteData(db, item.src, t1, t2) {
+					RollbackTransaction(db)
+					continue
+				}
+				measReceived[item.src] = 0
 			}
 			CommitTransaction(db)
 		}
@@ -367,6 +375,7 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 
 	affected, _ := result.RowsAffected()
 	slog.Debug("Inserted", "data", dp, "affected rows", affected)
+	measReceived[table] += affected
 
 	return true
 }

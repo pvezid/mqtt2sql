@@ -21,6 +21,7 @@ import (
 	"fmt"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"log/slog"
+	"time"
 )
 
 func MQTTHandler(brokerURL string, subtopic string, och chan<- string) bool {
@@ -34,10 +35,12 @@ func MQTTHandler(brokerURL string, subtopic string, och chan<- string) bool {
 	opts := mqtt.NewClientOptions()
 	opts.AddBroker(brokerURL)
 	opts.SetDefaultPublishHandler(messagePubHandler)
-	opts.SetAutoReconnect(true)
 	opts.SetConnectionLostHandler(func(client mqtt.Client, reason error) {
 		slog.Warn("MQTT connection lost", "broker", brokerURL, "reason", reason.Error())
 	})
+	opts.SetAutoReconnect(true)
+	opts.SetOrderMatters(false)
+	opts.SetKeepAlive(25 * time.Second)
 
 	mqttcli := mqtt.NewClient(opts)
 	if token := mqttcli.Connect(); token.Wait() && token.Error() != nil {
