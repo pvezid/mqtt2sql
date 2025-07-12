@@ -22,19 +22,25 @@ import (
 	"log/slog"
 )
 
-func JSONHandler(ich <-chan string, och chan<- Datapoint) {
+func JSONHandler(ich <-chan string) chan Datapoint {
 
-	for msg := range ich {
-		var dps []Datapoint
-		slog.Debug("String received", "msg", msg)
-		err := json.Unmarshal([]byte(msg), &dps)
-		if err != nil {
-			slog.Error("Unmarshal", "error", err)
-		} else {
-			for _, dp := range dps {
-				och <- dp
+	c := make(chan Datapoint, 10)
+
+	go func() {
+		defer close(c)
+		for msg := range ich {
+			var dps []Datapoint
+			slog.Debug("String received", "msg", msg)
+			err := json.Unmarshal([]byte(msg), &dps)
+			if err != nil {
+				slog.Error("Unmarshal", "error", err)
+			} else {
+				for _, dp := range dps {
+					c <- dp
+				}
 			}
 		}
-	}
-	close(och)
+	}()
+
+	return c
 }

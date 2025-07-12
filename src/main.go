@@ -42,18 +42,15 @@ func main() {
 		return
 	}
 
-	ch1 := make(chan string, 10)
-	ch2 := make(chan handlers.Datapoint, 10)
-
 	if infile != "" {
-		go handlers.FileHandler(infile, ch1)
-		go handlers.JSONHandler(ch1, ch2)
+		ch1 := handlers.FileHandler(infile)
+		ch2 := handlers.JSONHandler(ch1)
 		handlers.SqlBatchHandler(ch2)
 		os.Exit(0)
 	}
 
-	if handlers.MQTTHandler(brokerURL, subtopic, ch1) {
-		go handlers.JSONHandler(ch1, ch2)
+	if ch1 := handlers.MQTTHandler(brokerURL, subtopic); ch1 != nil {
+		ch2 := handlers.JSONHandler(ch1)
 		handlers.SqlHandler(ch2)
 	}
 }

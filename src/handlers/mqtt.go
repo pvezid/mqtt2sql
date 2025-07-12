@@ -24,12 +24,13 @@ import (
 	"time"
 )
 
-func MQTTHandler(brokerURL string, subtopic string, och chan<- string) bool {
+func MQTTHandler(brokerURL string, subtopic string) chan string {
+	c := make(chan string, 10)
 
 	var messagePubHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
 		buff := fmt.Sprintf("%s", msg.Payload())
 		slog.Debug("Message received", "topic", msg.Topic(), "payload", buff)
-		och <- buff
+		c <- buff
 	}
 
 	opts := mqtt.NewClientOptions()
@@ -45,17 +46,17 @@ func MQTTHandler(brokerURL string, subtopic string, och chan<- string) bool {
 	mqttcli := mqtt.NewClient(opts)
 	if token := mqttcli.Connect(); token.Wait() && token.Error() != nil {
 		slog.Error("MQTT connect", "broker", brokerURL, "error", token.Error())
-		return false
+		return nil
 	} else {
 		slog.Info("Connected", "broker", brokerURL)
 	}
 
 	if token := mqttcli.Subscribe(subtopic, 1, nil); token.Wait() && token.Error() != nil {
 		slog.Error("MQTT subscribe", "topic", subtopic, "error", token.Error())
-		return false
+		return nil
 	} else {
 		slog.Info("Subscribed", "topic", subtopic)
 	}
 
-	return true
+	return c
 }

@@ -23,27 +23,33 @@ import (
 	"os"
 )
 
-func FileHandler(filename string, och chan<- string) {
-	file := os.Stdin
-	var err error
+func FileHandler(filename string) chan string {
+	c := make(chan string, 10)
 
-	if filename != "-" {
-		file, err = os.Open(filename)
-		if err != nil {
-			slog.Error("File open", "filename", filename, "error", err)
-			return
+	go func() {
+		defer close(c)
+		file := os.Stdin
+		var err error
+
+		if filename != "-" {
+			file, err = os.Open(filename)
+			if err != nil {
+				slog.Error("File open", "filename", filename, "error", err)
+				return
+			}
+			defer file.Close()
 		}
-		defer file.Close()
-	}
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		msg := scanner.Text()
-		och <- msg
-		slog.Debug("File scanner", "payload", msg)
-	}
-	if err := scanner.Err(); err != nil {
-		slog.Error("File scanner", "error", err)
-	}
-	close(och)
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			msg := scanner.Text()
+			slog.Debug("File scanner", "payload", msg)
+			c <- msg
+		}
+		if err := scanner.Err(); err != nil {
+			slog.Error("File scanner", "error", err)
+		}
+	}()
+
+	return c
 }
