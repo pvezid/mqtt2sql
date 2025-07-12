@@ -35,8 +35,8 @@ type Item struct {
 	alist      string
 	clist      string
 	dlist      string
-	period     uint64
-	retention  uint64
+	period     int64
+	retention  int64
 }
 
 type Index struct {
@@ -47,21 +47,32 @@ type Index struct {
 }
 
 const (
-	connString    = "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql"
-	dispatchTable = "dispatch"
-	DefaultCol    = "value"
-	MargeTemps    = 40
+	connString      = "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql"
+	dispatchTable   = "dispatch"
+	defaultCol      = "value"
+	margeTemps      = 40
+	measurementTmpl = "measurements_%s"
 )
 
 var (
-	lastBrowsed  map[string]uint64
+	lastBrowsed  map[string]int64
 	measReceived map[string]int64
 )
 
-func SqliteHandler(ich <-chan Datapoint) {
+func SqlBatchHandler(ich <-chan Datapoint) {
+	cmdTemplate := "INSERT INTO %s (ts, sensorid, %s, name, place) values (%.3f, '%s', %v, '%s', '%s'); -- %v"
+
+	for dp := range ich {
+		table := fmt.Sprintf(measurementTmpl, dp.Measurement)
+		cmd := fmt.Sprintf(cmdTemplate, table, defaultCol, float64(dp.Timestamp)/1000.0, dp.Tags.ID, dp.Fields.Value, dp.Tags.Name, dp.Tags.Place, time.UnixMilli(dp.Timestamp))
+		fmt.Println(cmd)
+	}
+}
+
+func SqlHandler(ich <-chan Datapoint) {
 
 	ticker := time.NewTicker(3 * time.Minute)
-	lastBrowsed = make(map[string]uint64)
+	lastBrowsed = make(map[string]int64)
 	measReceived = make(map[string]int64)
 
 	db := InitDB()
@@ -84,13 +95,6 @@ func SqliteHandler(ich <-chan Datapoint) {
 			case t := <-ticker.C:
 				slog.Debug("Tick", "at", t)
 				if items, ok := ReadOrCreateDispatchingTable(db); ok {
-					for _, item := range items {
-						if maxts, ok := ReadMaxTimestamp(db, item.dst); ok {
-							lastBrowsed[item.dst] = uint64((uint64(maxts)/item.period)+1) * item.period
-						} else {
-							lastBrowsed[item.dst] = 0
-						}
-					}
 					ConsolidateData(db, items)
 				}
 			}
@@ -162,15 +166,20 @@ func CreateDispatchingIndex(db *sql.DB) bool {
 func ConsolidateData(db *sql.DB, items []Item) bool {
 	now := time.Now()
 	for _, item := range items {
+		if maxts, ok := ReadMaxTimestamp(db, item.dst); ok {
+			lastBrowsed[item.dst] = int64((int64(maxts)/item.period)+1) * item.period
+		} else {
+			lastBrowsed[item.dst] = 0
+		}
 		item.clist = mapNames(item.aggr, []string{}, "v%s")
 		item.dlist = mapNames(item.aggr, []string{}, "v%s DOUBLE NOT NULL")
 		idx := slices.IndexFunc(items, func(i Item) bool { return i.dst == item.src })
 		if idx >= 0 {
 			item.alist = mapNames(item.aggr, items[idx].aggr, "%%s(v%s)")
 		} else {
-			item.alist = mapNames(item.aggr, []string{DefaultCol, DefaultCol, DefaultCol, DefaultCol}, "%%s(%s)")
+			item.alist = mapNames(item.aggr, []string{defaultCol, defaultCol, defaultCol, defaultCol}, "%%s(%s)")
 		}
-		t2 := uint64(uint64((now.Unix()-MargeTemps))/item.period) * item.period
+		t2 := int64(int64((now.Unix()-margeTemps))/item.period) * item.period
 		t1 := lastBrowsed[item.dst]
 		slog.Debug(
 			"dispatching",
@@ -235,7 +244,7 @@ func CreateMeasurementTable(db *sql.DB, table string) bool {
 		place TINYTEXT
 	);
 	`
-	cmd := fmt.Sprintf(cmdTemplate, table, DefaultCol)
+	cmd := fmt.Sprintf(cmdTemplate, table, defaultCol)
 	if _, err := db.Exec(cmd); err != nil {
 		slog.Error("Unable to create", "table", table, "cmd", cmd, "err", err)
 		return false
@@ -351,8 +360,8 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	cmdTemplate := `
 	INSERT INTO %s (ts, sensorid, %s, name, place) values (?, ?, ?, ?, ?);
 	`
-	table := fmt.Sprintf("measurements_%s", dp.Measurement)
-	cmd := fmt.Sprintf(cmdTemplate, table, DefaultCol)
+	table := fmt.Sprintf(measurementTmpl, dp.Measurement)
+	cmd := fmt.Sprintf(cmdTemplate, table, defaultCol)
 	stmt, err := db.Prepare(cmd)
 	if err != nil {
 		slog.Warn("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err)
@@ -380,7 +389,7 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	return true
 }
 
-func InsertConsolidatedData(db *sql.DB, item Item, t1 uint64, t2 uint64) bool {
+func InsertConsolidatedData(db *sql.DB, item Item, t1 int64, t2 int64) bool {
 
 	cmdTemplate := `
 	INSERT INTO %s (ts, sensorid, %s, name, place)
@@ -418,7 +427,7 @@ func InsertConsolidatedData(db *sql.DB, item Item, t1 uint64, t2 uint64) bool {
 	return true
 }
 
-func DeleteData(db *sql.DB, table string, t1 uint64, t2 uint64) bool {
+func DeleteData(db *sql.DB, table string, t1 int64, t2 int64) bool {
 	cmdTemplate := `
 	DELETE FROM %s WHERE ts >= %d AND ts < %d;
 	`

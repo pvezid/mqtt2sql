@@ -28,6 +28,7 @@ import (
 var (
 	brokerURL string
 	subtopic  string
+	infile    string
 	debugmode bool
 )
 
@@ -36,25 +37,31 @@ func main() {
 	setFlags()
 	setLogger()
 
-	if subtopic == "" {
+	if subtopic == "" && infile == "" {
 		slog.Error("Topic not specified, use '-s topic'")
 		return
 	}
 
-	slog.Info("Starting")
-
 	ch1 := make(chan string, 10)
 	ch2 := make(chan handlers.Datapoint, 10)
 
+	if infile != "" {
+		go handlers.FileHandler(infile, ch1)
+		go handlers.JSONHandler(ch1, ch2)
+		handlers.SqlBatchHandler(ch2)
+		os.Exit(0)
+	}
+
 	if handlers.MQTTHandler(brokerURL, subtopic, ch1) {
 		go handlers.JSONHandler(ch1, ch2)
-		handlers.SqliteHandler(ch2)
+		handlers.SqlHandler(ch2)
 	}
 }
 
 func init() {
 	flag.StringVar(&brokerURL, "h", "tcp://mqtt:1883", "MQTT broker to use")
 	flag.StringVar(&subtopic, "s", "", "topic to be subscribed")
+	flag.StringVar(&infile, "r", "", "input file, replacing mqtt input")
 	flag.BoolVar(&debugmode, "debug", false, "set loglevel to DEBUG")
 }
 

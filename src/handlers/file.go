@@ -18,23 +18,32 @@
 package handlers
 
 import (
-	"encoding/json"
+	"bufio"
 	"log/slog"
+	"os"
 )
 
-func JSONHandler(ich <-chan string, och chan<- Datapoint) {
+func FileHandler(filename string, och chan<- string) {
+	file := os.Stdin
+	var err error
 
-	for msg := range ich {
-		var dps []Datapoint
-		slog.Debug("String received", "msg", msg)
-		err := json.Unmarshal([]byte(msg), &dps)
+	if filename != "-" {
+		file, err = os.Open(filename)
 		if err != nil {
-			slog.Error("Unmarshal", "error", err)
-		} else {
-			for _, dp := range dps {
-				och <- dp
-			}
+			slog.Error("File open", "filename", filename, "error", err)
+			return
 		}
+		defer file.Close()
+	}
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		msg := scanner.Text()
+		och <- msg
+		slog.Debug("File scanner", "payload", msg)
+	}
+	if err := scanner.Err(); err != nil {
+		slog.Error("File scanner", "error", err)
 	}
 	close(och)
 }
