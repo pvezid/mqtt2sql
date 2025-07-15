@@ -265,7 +265,7 @@ func CreateMeasurementIndex(db *sql.DB, table string) bool {
 func CreateConsolidatedTable(db *sql.DB, item Item) bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
-		ts DOUBLE NOT NULL,
+		ts INT NOT NULL,
 		sensorid TINYTEXT NOT NULL,
 		%s,
 		name TINYTEXT,
