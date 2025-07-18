@@ -46,6 +46,10 @@ type Index struct {
 	cols  string
 }
 
+type DB struct {
+	*sql.DB
+}
+
 const (
 	connString      = "ustd:m55PC2Qh@tcp(mariadb:3306)/mqtt2sql"
 	dispatchTable   = "dispatch"
@@ -75,11 +79,11 @@ func SqlHandler(ich <-chan Datapoint) {
 	lastBrowsed = make(map[string]int64)
 	measReceived = make(map[string]int64)
 
-	db := InitDB()
+	db := newDB()
 	if db != nil {
 		defer db.Close()
 		// results not used, this is to create the table as early as possible
-		ReadOrCreateDispatchingTable(db)
+		db.ReadOrCreateDispatchingTable()
 		for {
 			select {
 			case dp := <-ich:
@@ -91,11 +95,11 @@ func SqlHandler(ich <-chan Datapoint) {
 					"name", dp.Tags.Name,
 					"place", dp.Tags.Place,
 					"value", dp.Fields.Value)
-				InsertMeasurement(db, &dp)
+				db.InsertMeasurement(&dp)
 			case t := <-ticker.C:
 				slog.Debug("Tick", "at", t)
-				if items, ok := ReadOrCreateDispatchingTable(db); ok {
-					ConsolidateData(db, items)
+				if items, ok := db.ReadOrCreateDispatchingTable(); ok {
+					db.ConsolidateData(items)
 				}
 			}
 		}
@@ -104,22 +108,22 @@ func SqlHandler(ich <-chan Datapoint) {
 	ticker.Stop()
 }
 
-func InitDB() *sql.DB {
+func newDB() *DB {
 	if db, err := sql.Open("mysql", connString); err != nil {
 		slog.Error("Unable to open database", "err", err)
 		return nil
 	} else {
 		slog.Info("Database opened")
-		return db
+		return &DB{db}
 	}
 }
 
-func ReadOrCreateDispatchingTable(db *sql.DB) ([]Item, bool) {
-	items, err := ReadDispatchingTable(db)
+func (db *DB) ReadOrCreateDispatchingTable() ([]Item, bool) {
+	items, err := db.ReadDispatchingTable()
 	if err != nil {
 		slog.Warn("Unable to query", "table", dispatchTable, "err", err)
-		if CreateDispatchingTable(db) && CreateDispatchingIndex(db) {
-			if items, err = ReadDispatchingTable(db); err != nil {
+		if db.CreateDispatchingTable() && db.CreateDispatchingIndex() {
+			if items, err = db.ReadDispatchingTable(); err != nil {
 				slog.Error("Unable to query", "table", dispatchTable, "err", err)
 				return nil, false
 			}
@@ -130,7 +134,7 @@ func ReadOrCreateDispatchingTable(db *sql.DB) ([]Item, bool) {
 	return items, true
 }
 
-func CreateDispatchingTable(db *sql.DB) bool {
+func (db *DB) CreateDispatchingTable() bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
 		rank INT UNSIGNED NOT NULL,
@@ -155,18 +159,18 @@ func CreateDispatchingTable(db *sql.DB) bool {
 	return true
 }
 
-func CreateDispatchingIndex(db *sql.DB) bool {
+func (db *DB) CreateDispatchingIndex() bool {
 	indexes := []Index{
 		Index{"idxdisp_rank", "UNIQUE", dispatchTable, "rank"},
 		Index{"idxdisp_dst_table", "UNIQUE", dispatchTable, "dst_table"},
 	}
-	return CreateIndexes(db, indexes)
+	return db.CreateIndexes(indexes)
 }
 
-func ConsolidateData(db *sql.DB, items []Item) bool {
+func (db *DB) ConsolidateData(items []Item) bool {
 	now := time.Now()
 	for _, item := range items {
-		if maxts, ok := ReadMaxTimestamp(db, item.dst); ok {
+		if maxts, ok := db.ReadMaxTimestamp(item.dst); ok {
 			lastBrowsed[item.dst] = int64((int64(maxts)/item.period)+1) * item.period
 		} else {
 			lastBrowsed[item.dst] = 0
@@ -208,25 +212,25 @@ func ConsolidateData(db *sql.DB, items []Item) bool {
 			"last_ts", t1,
 			"ts", t2,
 			"received", measReceived[item.src])
-		if BeginTransaction(db) {
-			if !InsertConsolidatedData(db, item, t1, t2) {
-				RollbackTransaction(db)
+		if db.BeginTransaction() {
+			if !db.InsertConsolidatedData(item, t1, t2) {
+				db.RollbackTransaction()
 				continue
 			}
 			if item.retention > 0 && t2 > item.retention {
-				if !DeleteData(db, item.dst, 0, t2-item.retention) {
-					RollbackTransaction(db)
+				if !db.DeleteData(item.dst, 0, t2-item.retention) {
+					db.RollbackTransaction()
 					continue
 				}
 			}
 			if item.src_delete == "yes" {
-				if !DeleteData(db, item.src, t1, t2) {
-					RollbackTransaction(db)
+				if !db.DeleteData(item.src, t1, t2) {
+					db.RollbackTransaction()
 					continue
 				}
 				measReceived[item.src] = 0
 			}
-			CommitTransaction(db)
+			db.CommitTransaction()
 		}
 	}
 
@@ -234,7 +238,7 @@ func ConsolidateData(db *sql.DB, items []Item) bool {
 	return true
 }
 
-func CreateMeasurementTable(db *sql.DB, table string) bool {
+func (db *DB) CreateMeasurementTable(table string) bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
 		ts DOUBLE NOT NULL,
@@ -254,15 +258,15 @@ func CreateMeasurementTable(db *sql.DB, table string) bool {
 	return true
 }
 
-func CreateMeasurementIndex(db *sql.DB, table string) bool {
+func (db *DB) CreateMeasurementIndex(table string) bool {
 	indexes := []Index{
 		Index{"idxmeas_ts_sensorid", "", table, "ts, sensorid"},
 		Index{"idxmeas_ts", "", table, "ts"},
 	}
-	return CreateIndexes(db, indexes)
+	return db.CreateIndexes(indexes)
 }
 
-func CreateConsolidatedTable(db *sql.DB, item Item) bool {
+func (db *DB) CreateConsolidatedTable(item Item) bool {
 	cmdTemplate := `
 	CREATE TABLE IF NOT EXISTS %s (
 		ts INT NOT NULL,
@@ -282,15 +286,15 @@ func CreateConsolidatedTable(db *sql.DB, item Item) bool {
 	return true
 }
 
-func CreateConsolidatedIndex(db *sql.DB, table string) bool {
+func (db *DB) CreateConsolidatedIndex(table string) bool {
 	indexes := []Index{
 		Index{"idxcons_ts_sensorid_name_place", "UNIQUE", table, "ts, sensorid, name, place"},
 		Index{"idxcons_ts", "", table, "ts"},
 	}
-	return CreateIndexes(db, indexes)
+	return db.CreateIndexes(indexes)
 }
 
-func ReadDispatchingTable(db *sql.DB) ([]Item, error) {
+func (db *DB) ReadDispatchingTable() ([]Item, error) {
 	cmdTemplate := `
 	SELECT src_table, src_delete, dst_table, aggr1, aggr2, aggr3, aggr4, period, retention FROM %s ORDER BY rank;
 	`
@@ -328,7 +332,7 @@ func ReadDispatchingTable(db *sql.DB) ([]Item, error) {
 	return result, nil
 }
 
-func ReadMaxTimestamp(db *sql.DB, table string) (float64, bool) {
+func (db *DB) ReadMaxTimestamp(table string) (float64, bool) {
 	cmdTemplate := `
 	SELECT max(ts) FROM %s;
 	`
@@ -356,7 +360,7 @@ func ReadMaxTimestamp(db *sql.DB, table string) (float64, bool) {
 	}
 }
 
-func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
+func (db *DB) InsertMeasurement(dp *Datapoint) bool {
 	cmdTemplate := `
 	INSERT INTO %s (ts, sensorid, %s, name, place) values (?, ?, ?, ?, ?);
 	`
@@ -365,7 +369,7 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	stmt, err := db.Prepare(cmd)
 	if err != nil {
 		slog.Warn("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err)
-		if CreateMeasurementTable(db, table) && CreateMeasurementIndex(db, table) {
+		if db.CreateMeasurementTable(table) && db.CreateMeasurementIndex(table) {
 			if stmt, err = db.Prepare(cmd); err != nil {
 				slog.Error("Unable to prepare stmt", "table", table, "cmd", cmd, "err", err)
 				return false
@@ -389,7 +393,7 @@ func InsertMeasurement(db *sql.DB, dp *Datapoint) bool {
 	return true
 }
 
-func InsertConsolidatedData(db *sql.DB, item Item, t1 int64, t2 int64) bool {
+func (db *DB) InsertConsolidatedData(item Item, t1 int64, t2 int64) bool {
 
 	cmdTemplate := `
 	INSERT INTO %s (ts, sensorid, %s, name, place)
@@ -404,7 +408,7 @@ func InsertConsolidatedData(db *sql.DB, item Item, t1 int64, t2 int64) bool {
 	stmt, err := db.Prepare(cmd)
 	if err != nil {
 		slog.Warn("Unable to prepare stmt", "table", item.dst, "cmd", cmd, "err", err)
-		if CreateConsolidatedTable(db, item) && CreateConsolidatedIndex(db, item.dst) {
+		if db.CreateConsolidatedTable(item) && db.CreateConsolidatedIndex(item.dst) {
 			if stmt, err = db.Prepare(cmd); err != nil {
 				slog.Error("Unable to prepare stmt", "table", item.dst, "cmd", cmd, "err", err)
 				return false
@@ -427,7 +431,7 @@ func InsertConsolidatedData(db *sql.DB, item Item, t1 int64, t2 int64) bool {
 	return true
 }
 
-func DeleteData(db *sql.DB, table string, t1 int64, t2 int64) bool {
+func (db *DB) DeleteData(table string, t1 int64, t2 int64) bool {
 	cmdTemplate := `
 	DELETE FROM %s WHERE ts >= %d AND ts < %d;
 	`
@@ -451,7 +455,7 @@ func DeleteData(db *sql.DB, table string, t1 int64, t2 int64) bool {
 	return true
 }
 
-func BeginTransaction(db *sql.DB) bool {
+func (db *DB) BeginTransaction() bool {
 	if _, err := db.Exec("START TRANSACTION"); err != nil {
 		slog.Error("Unable to start a transaction", "err", err)
 		return false
@@ -459,7 +463,7 @@ func BeginTransaction(db *sql.DB) bool {
 	return true
 }
 
-func CommitTransaction(db *sql.DB) bool {
+func (db *DB) CommitTransaction() bool {
 	if _, err := db.Exec("COMMIT"); err != nil {
 		slog.Error("Unable to commit a transaction", "err", err)
 		return false
@@ -467,7 +471,7 @@ func CommitTransaction(db *sql.DB) bool {
 	return true
 }
 
-func RollbackTransaction(db *sql.DB) bool {
+func (db *DB) RollbackTransaction() bool {
 	if _, err := db.Exec("ROLLBACK"); err != nil {
 		slog.Error("Unable to rollback a transaction", "err", err)
 		return false
@@ -475,7 +479,7 @@ func RollbackTransaction(db *sql.DB) bool {
 	return true
 }
 
-func CreateIndexes(db *sql.DB, indexes []Index) bool {
+func (db *DB) CreateIndexes(indexes []Index) bool {
 	ret := true
 	cmdTemplate := "CREATE %s INDEX IF NOT EXISTS %s ON %s (%s)"
 
